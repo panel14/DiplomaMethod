@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="DiplomaMethod.Application/DiplomaMethod.Application.csproj" />
+  <Project Path="DiplomaMethod.Core/DiplomaMethod.Core.csproj" />
+  <Project Path="DiplomaMethod.UnitTests/DiplomaMethod.UnitTests.csproj" />
+  <Project Path="DiplomaMethod/DiplomaMethod.csproj" />
+  <Project Path="docker-compose.dcproj">
+    <Build />
+  </Project>
+</Solution>

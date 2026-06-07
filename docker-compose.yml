@@ -1,0 +1,6 @@
+services:
+  diplomamethod:
+    image: ${DOCKER_REGISTRY-}diplomamethod
+    build:
+      context: .
+      dockerfile: DiplomaMethod/Dockerfile
