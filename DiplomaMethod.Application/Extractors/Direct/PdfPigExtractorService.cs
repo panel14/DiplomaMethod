@@ -4,6 +4,7 @@ using DiplomaMethod.Core.Models.Documents;
 using DiplomaMethod.Core.Models.Extraction;
 using DiplomaMethod.Core.Models.LayoutClassification;
 using DiplomaMethod.Core.Services;
+using System.Diagnostics;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.Content;
 
@@ -54,9 +55,17 @@ public class PdfPigExtractorService(ITextValidator validator) : IExtractor
 
     public static List<Word> ExtractAllWords(Stream docStream, int pageNumber)
     {
-        docStream.Seek(0, SeekOrigin.Begin);
-        using var document = PdfDocument.Open(docStream);
-        return [.. document.GetPage(pageNumber).GetWords()];
+        try
+        {
+            docStream.Seek(0, SeekOrigin.Begin);
+            using var document = PdfDocument.Open(docStream, new ParsingOptions { UseLenientParsing = true});
+            return [.. document.GetPage(pageNumber).GetWords()];
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error during PDF word extraction: {ex}");
+            throw;
+        }
     }
 
     public static List<Word> ExtractWordsFromArea(DetectionResult detection, List<Word> words)

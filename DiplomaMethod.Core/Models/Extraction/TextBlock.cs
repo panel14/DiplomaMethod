@@ -9,7 +9,8 @@ public record TextBlock
     public required string Label { get; set; }
     public double Confidence { get; set; }
 
-    // Lines ending with '-' are hyphenated word-wraps — join directly; others get a space.
+    // A line ending with '-' is a hyphenated word-wrap: drop the hyphen and join the two halves
+    // directly (no space). Other lines are joined with a single space.
     public string Accumulate()
     {
         if (Lines.Count == 0) return string.Empty;
@@ -17,9 +18,17 @@ public record TextBlock
         for (int i = 0; i < Lines.Count; i++)
         {
             var text = Lines[i].Text;
-            sb.Append(text);
-            if (i < Lines.Count - 1 && !text.EndsWith('-'))
-                sb.Append(' ');
+            bool notLast = i < Lines.Count - 1;
+
+            if (notLast && text.EndsWith('-'))
+            {
+                sb.Append(text, 0, text.Length - 1); // strip the wrap hyphen, no separator
+            }
+            else
+            {
+                sb.Append(text);
+                if (notLast) sb.Append(' ');
+            }
         }
         return sb.ToString();
     }

@@ -3,7 +3,6 @@ using DiplomaMethod.Core.Models.LayoutClassification;
 using DiplomaMethod.Core.Options;
 using DiplomaMethod.Core.Services;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
 using SkiaSharp;
 
 namespace DiplomaMethod.Application.Classifiers;
@@ -24,7 +23,25 @@ public abstract class BaseOnnxClassifier : ILayoutClassifier, IDisposable
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
             };
-            options.AppendExecutionProvider_CUDA();
+
+            // Use CUDA only when the runtime actually exposes the provider, and never let a missing /
+            // mismatched CUDA stack abort startup — fall back to CPU. On a CPU-only or non-GPU
+            // onnxruntime native the CUDA entry point is absent (EntryPointNotFoundException), so the
+            // append is both availability-checked and wrapped.
+            if (OrtEnv.Instance().GetAvailableProviders().Contains("CUDAExecutionProvider"))
+            {
+                try
+                {
+                    // Provider-options API (libonnxruntime_providers_shared/_cuda) instead of the legacy
+                    // entry point, which the Linux GPU build does not export → EntryPointNotFoundException.
+                    using var cudaOptions = new OrtCUDAProviderOptions();
+                    options.AppendExecutionProvider_CUDA(cudaOptions);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"CUDA provider unavailable, using CPU: {ex.Message}");
+                }
+            }
             options.AppendExecutionProvider_CPU();
         }
 

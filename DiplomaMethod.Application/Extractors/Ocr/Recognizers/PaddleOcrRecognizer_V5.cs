@@ -16,9 +16,11 @@ namespace DiplomaMethod.Application.Extractors.Ocr.Recognizers;
 ///   1. Resize each line image to height=48, variable width (aspect-preserving).
 ///   2. Normalize pixels: (value/255 − 0.5) / 0.5  →  range [−1, 1].
 ///   3. Assemble NCHW batch tensor [B, 3, 48, maxW], padding shorter images with white.
-///   4. Run ONNX inference → CTC logits [B, T, num_classes].
+///   4. Run ONNX inference → CTC probabilities [B, T, num_classes] (the export already applies softmax).
 ///   5. Greedy CTC decode: argmax per timestep, collapse repeats, drop blank (index 0).
-///   6. Return text + mean softmax confidence at selected positions.
+///   6. Return text + mean confidence at selected positions. The model output values ARE probabilities,
+///      so confidence is read directly (as in PaddleOCR's preds_prob.max(axis=2).mean()); applying
+///      softmax again would collapse every score to ~1/num_classes.
 ///
 /// Compatible with models from https://huggingface.co/monkt/paddleocr-onnx
 /// (languages/eslav and languages/english).
@@ -227,7 +229,7 @@ public sealed class PaddleOcrRecognizer_V5(PaddleOcrRecognizerV5Options options)
 
             if (maxIdx != 0 && maxIdx != prev)
             {
-                total += SoftmaxProb(logits, tBase, numCls, maxIdx);
+                total += logits[tBase + maxIdx];
                 count++;
 
                 int ci = maxIdx - 1; // dict is 0-indexed; blank lives at output index 0
@@ -271,7 +273,7 @@ public sealed class PaddleOcrRecognizer_V5(PaddleOcrRecognizerV5Options options)
 
                 if (maxIdx != prev)
                 {
-                    total += SoftmaxProb(logits, tBase, numCls, maxIdx);
+                    total += logits[tBase + maxIdx];
                     count++;
 
                     int ci = maxIdx - 1;
@@ -294,20 +296,6 @@ public sealed class PaddleOcrRecognizer_V5(PaddleOcrRecognizerV5Options options)
         return best;
     }
 
-    // Numerically stable softmax probability at index `target`.
-    private static float SoftmaxProb(float[] arr, int offset, int count, int target)
-    {
-        float max = arr[offset];
-        for (int i = 1; i < count; i++)
-            if (arr[offset + i] > max) max = arr[offset + i];
-
-        double sum = 0.0;
-        for (int i = 0; i < count; i++)
-            sum += Math.Exp(arr[offset + i] - max);
-
-        return (float)(Math.Exp(arr[offset + target] - max) / sum);
-    }
-
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static IReadOnlyList<string> LoadDict(string path, bool useSpaceChar)
@@ -328,9 +316,28 @@ public sealed class PaddleOcrRecognizer_V5(PaddleOcrRecognizerV5Options options)
     {
         var so = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
 
+        // The CPU arena trades steady-state memory for speed; let the caller opt out (see options).
+        so.EnableCpuMemArena = options.EnableCpuMemArena;
+
         if (options.UseGpu &&
             OrtEnv.Instance().GetAvailableProviders().Contains("CUDAExecutionProvider"))
-            so.AppendExecutionProvider_CUDA(options.GpuId);
+        {
+            try
+            {
+                // Provider-options API (libonnxruntime_providers_shared/_cuda) instead of the legacy
+                // entry point, which the Linux GPU build does not export → EntryPointNotFoundException.
+                using var cudaOptions = new OrtCUDAProviderOptions();
+                cudaOptions.UpdateOptions(new Dictionary<string, string>
+                {
+                    ["device_id"] = options.GpuId.ToString()
+                });
+                so.AppendExecutionProvider_CUDA(cudaOptions);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"CUDA unavailable for PaddleV5, using CPU: {ex.Message}");
+            }
+        }
 
         so.AppendExecutionProvider_CPU();
         return new InferenceSession(options.ModelPath, so);

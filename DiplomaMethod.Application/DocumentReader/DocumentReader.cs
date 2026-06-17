@@ -50,7 +50,6 @@ public class DocumentReader : IDocumentReader
             int nativeW = page.GetPageWidth();
             if (nativeW <= 0) return 300.0 / 72.0;
             double scale = TargetPageWidthPx / nativeW;
-            // Clamp: floor at 72 DPI, ceiling at 300 DPI
             return Math.Clamp(scale, 1.0, 300.0 / 72.0);
         }
         catch
@@ -61,6 +60,11 @@ public class DocumentReader : IDocumentReader
 
     private async IAsyncEnumerable<LayoutImage> ReadPdfAsync(string path)
     {
+        // The raw PDF bytes are needed by the direct (L1) PdfPig extractor, which reads the actual
+        // embedded document text — not the rendered raster. Each page gets its own seekable view over
+        // the shared byte[] (no copy), so PdfDocument.Open works and per-page disposal is independent.
+        var pdfBytes = await File.ReadAllBytesAsync(path);
+
         var scale = ComputeScale(path);
         using var docReader = DocLib.Instance.GetDocReader(path, new PageDimensions(scale));
 
@@ -87,7 +91,7 @@ public class DocumentReader : IDocumentReader
                 yield return new LayoutImage
                 {
                     CachedImage = image,
-                    ImageStream = Stream.Null,
+                    ImageStream = new MemoryStream(pdfBytes, writable: false),
                     Page = new PageInfo
                     {
                         DocumentId = Path.GetFileNameWithoutExtension(path),

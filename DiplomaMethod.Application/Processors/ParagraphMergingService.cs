@@ -6,8 +6,13 @@ namespace DiplomaMethod.Application.Processors;
 
 public class ParagraphMergingService : IMergingService
 {
-    private const int MergeThreshold = 3;
     private const string TextLabel = "Text";
+
+    // Geometric gate for a merge: the two blocks must share a column (horizontal overlap) and be
+    // vertically adjacent. Continuation hyphens/case only confirm a merge that geometry already allows.
+    private const double MinHorizontalOverlap = 0.5;   // fraction of the narrower block's width
+    private const double MaxVerticalGapFactor = 1.5;   // gap below this × avg line height = adjacent
+    private const double MaxVerticalOverlapFactor = 1.0; // reject blocks overlapping more than this × line height
 
     public Task<IEnumerable<TextBlock>> MergeAsync(IEnumerable<TextBlock> blocks)
     {
@@ -21,7 +26,7 @@ public class ParagraphMergingService : IMergingService
         for (int i = 1; i < list.Count; i++)
         {
             var next = list[i];
-            if (ComputeScore(current, next) >= MergeThreshold)
+            if (ShouldMerge(current, next))
                 current = MergeBlocks(current, next);
             else
             {
@@ -34,30 +39,43 @@ public class ParagraphMergingService : IMergingService
         return Task.FromResult<IEnumerable<TextBlock>>(result);
     }
 
-    private static int ComputeScore(TextBlock a, TextBlock b)
+    private static bool ShouldMerge(TextBlock a, TextBlock b)
     {
-        if (a.Label != TextLabel || b.Label != TextLabel) return 0;
+        if (a.Label != TextLabel || b.Label != TextLabel) return false;
+        if (a.Lines.Count == 0 || b.Lines.Count == 0) return false;
 
-        var aLast = a.Lines.Count > 0 ? a.Lines[^1].Text.TrimEnd() : "";
-        var bFirst = b.Lines.Count > 0 ? b.Lines[0].Text.TrimStart() : "";
+        // ── Geometric gate (necessary) ──────────────────────────────────────────
+        // Same column: blocks must overlap horizontally. Two-column layouts have ~0 overlap, so a
+        // left-column block can never merge with a right-column one regardless of text cues.
+        if (HorizontalOverlapFraction(a.Box, b.Box) < MinHorizontalOverlap) return false;
 
-        int score = 0;
-
-        if (aLast.EndsWith('-'))
-            score += 3;
-
-        if (aLast.Length > 0 && !IsEndOfSentence(aLast[^1]))
-            score += 1;
-
-        if (bFirst.Length > 0 && char.IsLower(bFirst[0]))
-            score += 1;
-
-        double gap = b.Box.Y - (a.Box.Y + a.Box.Height);
         double avgLineHeight = GetAvgLineHeight(a, b);
-        if (gap >= 0 && avgLineHeight > 0 && gap < avgLineHeight)
-            score += 1;
+        if (avgLineHeight <= 0) return false;
 
-        return score;
+        // Vertically adjacent: a small gap (continuation) or slight overlap, but not a large jump
+        // and not a heavy overlap (which signals duplicate/nested boxes, not a continuation).
+        double gap = b.Box.Y - (a.Box.Y + a.Box.Height);
+        if (gap > avgLineHeight * MaxVerticalGapFactor) return false;
+        if (gap < -avgLineHeight * MaxVerticalOverlapFactor) return false;
+
+        // ── Textual continuation cue (at least one required) ────────────────────
+        var aLast  = a.Lines[^1].Text.TrimEnd();
+        var bFirst = b.Lines[0].Text.TrimStart();
+
+        bool hyphen        = aLast.EndsWith('-');
+        bool noSentenceEnd = aLast.Length > 0 && !IsEndOfSentence(aLast[^1]);
+        bool lowerStart    = bFirst.Length > 0 && char.IsLower(bFirst[0]);
+
+        return hyphen || (noSentenceEnd && lowerStart);
+    }
+
+    // Fraction of the narrower block's width that overlaps the other horizontally (0..1).
+    private static double HorizontalOverlapFraction(BoundingBox a, BoundingBox b)
+    {
+        double inter = Math.Min(a.X + a.Width, b.X + b.Width) - Math.Max(a.X, b.X);
+        if (inter <= 0) return 0;
+        double minW = Math.Min(a.Width, b.Width);
+        return minW > 0 ? inter / minW : 0;
     }
 
     private static TextBlock MergeBlocks(TextBlock a, TextBlock b)

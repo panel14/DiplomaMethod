@@ -13,7 +13,6 @@ public class TextExtractionPipeline(
     ILayoutClassifier layoutClassifier,
     IExtractor manualExtractor,
     IExtractor ocrExtractor,
-    IExtractor tesseractExtractor,
     IExtractor? florenceExtractor,
     IExtractor tableExtractor,
     ISortingService sortingService,
@@ -26,7 +25,6 @@ public class TextExtractionPipeline(
     private readonly ILayoutClassifier _layoutClassifier = layoutClassifier;
     private readonly IExtractor _manualExtractor = manualExtractor;
     private readonly IExtractor _ocrExtractor = ocrExtractor;
-    private readonly IExtractor _tesseractExtractor = tesseractExtractor;
     private readonly IExtractor? _florenceExtractor = florenceExtractor;
     private readonly IExtractor _tableExtractor = tableExtractor;
     private readonly ISortingService _sortingService = sortingService;
@@ -65,7 +63,6 @@ public class TextExtractionPipeline(
         var tableBlock       = new TransformBlock<PipelineData, PipelineData>(ExtractTablesAsync, blockOptions);
         var manualBlock      = new TransformBlock<PipelineData, PipelineData>(ExtractManualAsync, blockOptions);
         var ocrBlock         = new TransformBlock<PipelineData, PipelineData>(ExtractOcrAsync, blockOptions);
-        var tesseractBlock   = new TransformBlock<PipelineData, PipelineData>(ExtractTesseractAsync, blockOptions);
         var florenceBlock    = new TransformBlock<PipelineData, PipelineData>(ExtractFlorenceAsync, blockOptions);
         var postProcessBlock = new ActionBlock<PipelineData>(
             data => PostProcessAsync(data, results, resultsLock), blockOptions);
@@ -74,8 +71,7 @@ public class TextExtractionPipeline(
         classifyBlock.LinkTo(tableBlock, linkOptions);
         tableBlock.LinkTo(manualBlock, linkOptions);
         manualBlock.LinkTo(ocrBlock, linkOptions);
-        ocrBlock.LinkTo(tesseractBlock, linkOptions);
-        tesseractBlock.LinkTo(florenceBlock, linkOptions);
+        ocrBlock.LinkTo(florenceBlock, linkOptions);
         florenceBlock.LinkTo(postProcessBlock, linkOptions);
 
         await foreach (var page in pages)
@@ -203,15 +199,33 @@ public class TextExtractionPipeline(
         {
             var pendingDets = FilterPending(data.ImageDetections, data.PendingIndices);
             var results = await _ocrExtractor.ReadAsync(data.Image, pendingDets);
+            if (results.Count == 0) return data;
 
-            int resolved = 0;
+            // OCR splits a detection into paragraph blocks whose boxes are sub-regions of the detection
+            // (page-space). Overlapping YOLO detections would otherwise each claim the same block, so
+            // assign every block to exactly one pending detection — the one it overlaps most — and
+            // resolve each detection from its own assigned blocks. This prevents duplicate blocks.
+            var blocksByDet = new Dictionary<int, List<TextBlock>>();
             foreach (var block in results)
             {
-                int idx = FindByBbox(data.ImageDetections, data.PendingIndices, block.Box);
-                if (idx < 0) continue;
-                if (block.Confidence >= ValidBlockConfidence)
+                int bestIdx = -1;
+                double bestOverlap = 0;
+                foreach (int idx in data.PendingIndices)
                 {
-                    data.FinalResults.Add(block);
+                    double ov = OverlapFraction(data.ImageDetections[idx].BoundingBox, block.Box);
+                    if (ov >= 0.5 && ov > bestOverlap) { bestOverlap = ov; bestIdx = idx; }
+                }
+                if (bestIdx < 0) continue;
+                (blocksByDet.TryGetValue(bestIdx, out var bucket) ? bucket : blocksByDet[bestIdx] = []).Add(block);
+            }
+
+            int resolved = 0;
+            foreach (var (idx, blocks) in blocksByDet)
+            {
+                double avgConf = blocks.Average(b => b.Confidence);
+                if (avgConf >= ValidBlockConfidence)
+                {
+                    data.FinalResults.AddRange(blocks);
                     data.PendingIndices.Remove(idx);
                     resolved++;
                 }
@@ -221,38 +235,6 @@ public class TextExtractionPipeline(
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"OCR extraction failed: {ex.Message}");
-        }
-        return data;
-    }
-
-    private async Task<PipelineData> ExtractTesseractAsync(PipelineData data)
-    {
-        if (data.PendingIndices.Count == 0 || data.ImageDetections.Count == 0)
-            return data;
-
-        _log($"[Page {data.Image.Page.PageNumber}] L3 Tesseract: {data.PendingIndices.Count} region(s)...");
-        try
-        {
-            var pendingDets = FilterPending(data.ImageDetections, data.PendingIndices);
-            var results = await _tesseractExtractor.ReadAsync(data.Image, pendingDets);
-
-            int resolved = 0;
-            foreach (var block in results)
-            {
-                int idx = FindByBbox(data.ImageDetections, data.PendingIndices, block.Box);
-                if (idx < 0) continue;
-                if (block.Confidence >= ValidBlockConfidence)
-                {
-                    data.FinalResults.Add(block);
-                    data.PendingIndices.Remove(idx);
-                    resolved++;
-                }
-            }
-            _log($"[Page {data.Image.Page.PageNumber}] L3 done: {resolved} resolved, {data.PendingIndices.Count} pending");
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"Tesseract extraction failed: {ex.Message}");
         }
         return data;
     }
@@ -280,6 +262,9 @@ public class TextExtractionPipeline(
 
     private async Task PostProcessAsync(PipelineData data, List<TextBlock> results, object resultsLock)
     {
+        // Terminal block: dispose the page (rendered SKImage + PDF stream) once it is fully processed,
+        // on every path including the empty-result early return. Otherwise pages accumulate in the
+        // dataflow buffers and pin tens of MB each until GC.
         try
         {
             if (data.FinalResults.Count == 0) return;
@@ -299,37 +284,33 @@ public class TextExtractionPipeline(
         {
             System.Diagnostics.Debug.WriteLine($"Post-processing failed: {ex.Message}");
         }
+        finally
+        {
+            data.Image.Dispose();
+        }
     }
 
     private static IReadOnlyList<DetectionResult> FilterPending(
         IReadOnlyList<DetectionResult> all, HashSet<int> pending) =>
         [.. pending.OrderBy(i => i).Select(i => all[i])];
 
-    private static int FindByBbox(
-        IReadOnlyList<DetectionResult> all, HashSet<int> pending, BoundingBox bbox)
-    {
-        foreach (int i in pending)
-        {
-            var b = all[i].BoundingBox;
-            if (b.X == bbox.X && b.Y == bbox.Y && b.Width == bbox.Width && b.Height == bbox.Height)
-                return i;
-        }
-        return -1;
-    }
-
     private static bool IsTableLabel(string? label) =>
         string.Equals(label, TableLabel, StringComparison.OrdinalIgnoreCase);
 
-    // Checks if ≥50% of block's area is within det region (used for L1 where Box ≠ det.BoundingBox)
+    // Checks if ≥50% of block's area is within det region (used by L1 where Box ≠ det.BoundingBox)
     private static bool HasSignificantOverlap(BoundingBox det, BoundingBox block)
+        => OverlapFraction(det, block) >= 0.5;
+
+    // Fraction of `block`'s area contained in `det` (0..1).
+    private static double OverlapFraction(BoundingBox det, BoundingBox block)
     {
         double ix1 = Math.Max(det.X, block.X);
         double iy1 = Math.Max(det.Y, block.Y);
         double ix2 = Math.Min(det.X + det.Width, block.X + block.Width);
         double iy2 = Math.Min(det.Y + det.Height, block.Y + block.Height);
-        if (ix2 <= ix1 || iy2 <= iy1) return false;
+        if (ix2 <= ix1 || iy2 <= iy1) return 0;
         double area = block.Width * block.Height;
-        return area > 0 && (ix2 - ix1) * (iy2 - iy1) / area >= 0.5;
+        return area > 0 ? (ix2 - ix1) * (iy2 - iy1) / area : 0;
     }
 
     private static async IAsyncEnumerable<LayoutImage> FeedSingle(LayoutImage image)

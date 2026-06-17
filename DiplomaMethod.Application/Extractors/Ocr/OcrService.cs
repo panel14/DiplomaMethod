@@ -55,9 +55,9 @@ public class OcrService(
         });
     }
 
-    // Cap on images per Paddle inference call: bounds GPU memory per batch while keeping batches
-    // large enough to saturate the device (see RecognizeBucketedAsync).
-    private const int MaxInferenceBatch = 128;
+    // Cap on images per Paddle inference call (see RecognizeBucketedAsync). Bounds peak activation
+    // memory per batch while keeping batches large enough to amortize call overhead. Configurable.
+    private int MaxInferenceBatch => Math.Max(1, _options.MaxInferenceBatch);
 
     private async Task<IReadOnlyList<TextBlock>> ProcessImageAsync(
         SKImage sourceImage, IReadOnlyList<DetectionResult> detection)
@@ -83,7 +83,7 @@ public class OcrService(
 
             string blockLabel = string.IsNullOrEmpty(det.Label) ? "Text" : det.Label;
 
-            foreach (var component in GetComponents(blockImage, det.Label))
+            foreach (var component in GetComponents(blockImage, det.Label, _options.UseDocstrumClustering))
             {
                 using var componentImage = CropImage(blockImage, component);
                 if (componentImage == null) continue;
@@ -100,7 +100,8 @@ public class OcrService(
                     try
                     {
                         var lineResults = await RecognizeLinesAsync(lineImages);
-                        AssembleComponent(component, lineRegions, lineResults, blockLabel, results);
+                        AssembleComponent(component, det.BoundingBox.X, det.BoundingBox.Y,
+                            lineRegions, lineResults, blockLabel, results);
                     }
                     finally
                     {
@@ -135,7 +136,7 @@ public class OcrService(
 
             string blockLabel = string.IsNullOrEmpty(det.Label) ? "Text" : det.Label;
 
-            foreach (var component in GetComponents(blockImage, det.Label))
+            foreach (var component in GetComponents(blockImage, det.Label, _options.UseDocstrumClustering))
             {
                 using var componentImage = CropImage(blockImage, component);
                 if (componentImage == null) continue;
@@ -147,7 +148,8 @@ public class OcrService(
                     var lineRegions = SplitLines(workImage);
                     if (lineRegions.Count == 0) continue;
 
-                    var pending = new PendingComponent(component, blockLabel, lineRegions);
+                    var pending = new PendingComponent(
+                        component, det.BoundingBox.X, det.BoundingBox.Y, blockLabel, lineRegions);
                     foreach (var region in lineRegions)
                     {
                         using var lineImg = workImage.Subset(region);
@@ -181,7 +183,8 @@ public class OcrService(
                 for (int li = 0; li < pc.LineRegions.Count; li++)
                     lineResults[li] = JoinWindows(windowResults, pc.LineWindowStart[li], pc.LineWindowCount[li]);
 
-                AssembleComponent(pc.Box, pc.LineRegions, lineResults, pc.BlockLabel, results);
+                AssembleComponent(pc.Box, pc.DetOffsetX, pc.DetOffsetY,
+                    pc.LineRegions, lineResults, pc.BlockLabel, results);
             }
         }
         finally
@@ -192,11 +195,11 @@ public class OcrService(
         return results;
     }
 
-    // Layout components of a block: the whole box for atomic labels, Docstrum clusters otherwise,
-    // sorted top-to-bottom then left-to-right.
-    private static List<BoundingBox> GetComponents(SKImage blockImage, string? label)
+    // Layout components of a block: the whole box for atomic labels (or when Docstrum clustering is
+    // disabled), Docstrum clusters otherwise, sorted top-to-bottom then left-to-right.
+    private static List<BoundingBox> GetComponents(SKImage blockImage, string? label, bool useDocstrum)
     {
-        List<BoundingBox> components = IsAtomicLabel(label)
+        List<BoundingBox> components = (!useDocstrum || IsAtomicLabel(label))
             ? [new BoundingBox(0, 0, blockImage.Width, blockImage.Height)]
             : DocstrumImageAnalyzer.ClusterComponents(blockImage);
 
@@ -246,8 +249,11 @@ public class OcrService(
     }
 
     // Builds TextLines from recognized line results and adds the resulting paragraph blocks.
+    // offsetX/offsetY translate component-local coordinates into source-image (page) space — the
+    // component box is relative to the cropped detection region, so the detection's top-left is added
+    // back so the pipeline can match the returned blocks against the page-space detections.
     private void AssembleComponent(
-        BoundingBox component, IReadOnlyList<SKRectI> lineRegions,
+        BoundingBox component, double offsetX, double offsetY, IReadOnlyList<SKRectI> lineRegions,
         IReadOnlyList<(string Text, float Score)> lineResults, string blockLabel, List<TextBlock> results)
     {
         var    lines               = new List<TextLine>();
@@ -263,8 +269,8 @@ public class OcrService(
             {
                 Text = text,
                 Box  = new BoundingBox(
-                    component.X + lineRegions[i].Left,
-                    component.Y + lineRegions[i].Top,
+                    component.X + offsetX + lineRegions[i].Left,
+                    component.Y + offsetY + lineRegions[i].Top,
                     lineRegions[i].Width,
                     lineRegions[i].Height)
             });
@@ -273,7 +279,9 @@ public class OcrService(
         if (lines.Count == 0) return;
 
         double componentConf = totalLineConfidence / lines.Count;
-        var rawBlock   = new TextBlock { Lines = lines, Box = component, Label = blockLabel };
+        var pageBox    = new BoundingBox(
+            component.X + offsetX, component.Y + offsetY, component.Width, component.Height);
+        var rawBlock   = new TextBlock { Lines = lines, Box = pageBox, Label = blockLabel };
         var paragraphs = TextBlockAnalyzer.SplitByLineIndent(rawBlock, blockLabel);
 
         foreach (var para in paragraphs)
@@ -309,9 +317,12 @@ public class OcrService(
     }
 
     // Gathered lines of one component, awaiting page-level window recognition.
-    private sealed class PendingComponent(BoundingBox box, string blockLabel, List<SKRectI> lineRegions)
+    private sealed class PendingComponent(
+        BoundingBox box, double detOffsetX, double detOffsetY, string blockLabel, List<SKRectI> lineRegions)
     {
         public BoundingBox Box { get; } = box;
+        public double DetOffsetX { get; } = detOffsetX;
+        public double DetOffsetY { get; } = detOffsetY;
         public string BlockLabel { get; } = blockLabel;
         public List<SKRectI> LineRegions { get; } = lineRegions;
         public List<int> LineWindowStart { get; } = [];

@@ -4,12 +4,10 @@ using DiplomaMethod.Application.Extractors.Direct;
 using DiplomaMethod.Application.Extractors.Direct.Heuristics.Base;
 using DiplomaMethod.Application.Extractors.Direct.Heuristics.Strong;
 using DiplomaMethod.Application.Extractors.Direct.Heuristics.Threshold;
-using DiplomaMethod.Application.Extractors.Fallback;
 using DiplomaMethod.Application.Extractors.Fallback.Florence;
 using DiplomaMethod.Application.Extractors.Ocr;
 using DiplomaMethod.Application.Extractors.Ocr.Heuristics;
 using DiplomaMethod.Application.Extractors.Ocr.Postprocessors;
-using DiplomaMethod.Application.Extractors.Ocr.Recognizers;
 using DiplomaMethod.Application.Extractors.Ocr.Splitters.Line;
 using DiplomaMethod.Application.Extractors.Ocr.Splitters.Window;
 using DiplomaMethod.Application.Extractors.Ocr.Splitters.Word;
@@ -22,17 +20,54 @@ using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+// Document formats supported by DocumentReader; folders are scanned for these.
+var SupportedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    ".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"
+};
+
+Console.WriteLine(string.Join(", ", Microsoft.ML.OnnxRuntime.OrtEnv.Instance().GetAvailableProviders()));
+
 if (args.Length == 0)
 {
-    Console.Error.WriteLine("Usage: DiplomaMethod <file1> [file2] [file3] ...");
+    Console.Error.WriteLine("Usage: DiplomaMethod <file-or-folder> [file-or-folder] ...");
+    Console.Error.WriteLine("  Folders are scanned recursively for supported documents: " +
+        string.Join(", ", SupportedExtensions));
     return 1;
 }
 
-var inputFiles = args.Where(File.Exists).ToList();
-var missing    = args.Where(a => !File.Exists(a)).ToList();
+var inputFiles = new List<string>();
+var missing    = new List<string>();
+
+foreach (var arg in args)
+{
+    if (Directory.Exists(arg))
+    {
+        var found = Directory
+            .EnumerateFiles(arg, "*", SearchOption.AllDirectories)
+            .Where(f => SupportedExtensions.Contains(Path.GetExtension(f)))
+            .ToList();
+
+        if (found.Count == 0)
+            Console.Error.WriteLine($"[WARN] No supported documents in folder, skipping: {arg}");
+        else
+            inputFiles.AddRange(found);
+    }
+    else if (File.Exists(arg))
+    {
+        inputFiles.Add(arg);
+    }
+    else
+    {
+        missing.Add(arg);
+    }
+}
 
 foreach (var m in missing)
-    Console.Error.WriteLine($"[WARN] File not found, skipping: {m}");
+    Console.Error.WriteLine($"[WARN] Path not found, skipping: {m}");
+
+// De-duplicate overlapping folder/file args while preserving discovery order.
+inputFiles = [.. inputFiles.Distinct(StringComparer.OrdinalIgnoreCase)];
 
 if (inputFiles.Count == 0)
 {
@@ -72,20 +107,15 @@ var paddleV5Options = new PaddleOcrRecognizerV5Options
     GpuId                   = cfg.PaddleV5.GpuId,
     UseSpaceChar            = cfg.PaddleV5.UseSpaceChar,
     WordSpaceBlankThreshold = cfg.PaddleV5.WordSpaceBlankThreshold,
-};
-
-var tessOptions = new TesseractOptions
-{
-    TessDataPath = ResolvePath(cfg.Tesseract.TessDataPath),
-    Language = cfg.Tesseract.Language,
-    PageSegMode = cfg.Tesseract.PageSegMode,
-    UpscaleMinHeight = cfg.Tesseract.UpscaleMinHeight
+    EnableCpuMemArena       = cfg.PaddleV5.EnableCpuMemArena,
 };
 
 var ocrOptions = new OcrOptions
 {
-    MinPaddleScore   = cfg.Ocr.MinPaddleScore,
-    WordSegmentation = cfg.Ocr.WordSegmentation,
+    MinPaddleScore        = cfg.Ocr.MinPaddleScore,
+    WordSegmentation      = cfg.Ocr.WordSegmentation,
+    UseDocstrumClustering = cfg.Ocr.UseDocstrumClustering,
+    MaxInferenceBatch     = cfg.Ocr.MaxInferenceBatch,
 };
 
 var stepSw = Stopwatch.StartNew();
@@ -129,17 +159,11 @@ stepSw.Restart();
 using var tableExtractor = new PaddleTableExtractor(paddleOptions);
 Log($"Paddle table ready ({stepSw.Elapsed.TotalSeconds:F1}s)");
 
-Log("Loading Tesseract...");
-stepSw.Restart();
-using var tesseractRecognizer = new TesseractOcrRecognizer(tessOptions);
-Log($"Tesseract ready ({stepSw.Elapsed.TotalSeconds:F1}s)");
-
 var pipeline = new TextExtractionPipeline(
     documentReader:     new DocumentReader(),
     layoutClassifier:   layoutClassifier,
     manualExtractor:    new PdfPigExtractorService(textValidator),
     ocrExtractor:       ocrService,
-    tesseractExtractor: new TesseractBlockExtractor(tesseractRecognizer, ocrHeuristics),
     florenceExtractor:  florenceExtractor,
     tableExtractor:     tableExtractor,
     sortingService:     new GeometrySortingService(),
@@ -154,7 +178,9 @@ var jsonOptions = new JsonSerializerOptions
 {
     WriteIndented = true,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    // Emit Cyrillic (and other non-ASCII) literally instead of \uXXXX escapes.
+    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
 };
 
 foreach (var inputFile in inputFiles)
@@ -167,9 +193,11 @@ foreach (var inputFile in inputFiles)
 
     Log($"Extracted {blocks.Count} blocks in {fileSw.Elapsed.TotalSeconds:F1}s");
 
-    string outputFile = Path.Combine(
-        Path.GetDirectoryName(Path.GetFullPath(inputFile))!,
-        Path.GetFileNameWithoutExtension(inputFile) + "_extracted.json");
+    string outputDir  = Path.GetDirectoryName(Path.GetFullPath(inputFile))!;
+    string baseName   = Path.GetFileNameWithoutExtension(inputFile);
+    string outputFile = Path.Combine(outputDir, baseName + "_extracted.json");
+    string simpleFile = Path.Combine(outputDir, baseName + "_extracted_simple.json");
+    string txtFile    = Path.Combine(outputDir, baseName + "_extracted.txt");
 
     var output = new ExtractionOutput(
         InputFile:      Path.GetFullPath(inputFile),
@@ -184,8 +212,29 @@ foreach (var inputFile in inputFiles)
                 l.Text,
                 new BoxOutput(l.Box.X, l.Box.Y, l.Box.Width, l.Box.Height)))]))]);
 
+    // Simple view: one accumulated text per block (no per-line breakdown), easier to read.
+    var simpleOutput = new SimpleExtractionOutput(
+        InputFile:      Path.GetFullPath(inputFile),
+        ProcessedAt:    DateTime.UtcNow.ToString("O"),
+        ElapsedSeconds: Math.Round(fileSw.Elapsed.TotalSeconds, 2),
+        BlockCount:     blocks.Count,
+        Blocks:         [.. blocks.Select(b => new SimpleBlockOutput(
+            Label:      b.Label,
+            Confidence: Math.Round(b.Confidence, 4),
+            Box:        new BoxOutput(b.Box.X, b.Box.Y, b.Box.Width, b.Box.Height),
+            Text:       b.Accumulate()))]);
+
+    // Plain text: one block (accumulated, de-hyphenated) per line — the format the quality scripts
+    // expect (evaluate_quality reads it whole; evaluate_semantics splits on newlines into blocks).
+    var plainText = string.Join('\n',
+        blocks.Select(b => b.Accumulate() + "\n").Where(t => !string.IsNullOrWhiteSpace(t)));
+
     await File.WriteAllTextAsync(outputFile, JsonSerializer.Serialize(output, jsonOptions));
-    Log($"Output: {outputFile}\n");
+    await File.WriteAllTextAsync(simpleFile, JsonSerializer.Serialize(simpleOutput, jsonOptions));
+    await File.WriteAllTextAsync(txtFile, plainText, new System.Text.UTF8Encoding(false));
+    Log($"Output: {outputFile}");
+    Log($"Simple: {simpleFile}");
+    Log($"Text:   {txtFile}\n");
 }
 
 florenceEngine?.Dispose();
@@ -203,10 +252,11 @@ static string ResolvePath(string path) =>
 
 static AppSettings LoadSettings()
 {
-    var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+    var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.local.json")
+        ?? Path.Combine(AppContext.BaseDirectory, "appsettings.json");
     if (!File.Exists(configPath))
     {
-        Console.Error.WriteLine($"[WARN] appsettings.json not found at {configPath}, using defaults");
+        Console.Error.WriteLine($"[WARN] appsettings not found at {configPath}, using defaults");
         return new AppSettings();
     }
 
@@ -261,12 +311,15 @@ record PaddleV5Settings
     public int    GpuId                   { get; init; } = 0;
     public bool   UseSpaceChar            { get; init; } = false;
     public int    WordSpaceBlankThreshold { get; init; } = 0;
+    public bool   EnableCpuMemArena       { get; init; } = true;
 }
 
 record OcrSettings
 {
-    public float                MinPaddleScore   { get; init; } = 0.8f;
-    public WordSegmentationMode WordSegmentation { get; init; } = WordSegmentationMode.None;
+    public float                MinPaddleScore        { get; init; } = 0.8f;
+    public WordSegmentationMode WordSegmentation      { get; init; } = WordSegmentationMode.None;
+    public bool                 UseDocstrumClustering { get; init; } = false;
+    public int                  MaxInferenceBatch     { get; init; } = 32;
 }
 
 record ExtractionOutput(
@@ -283,5 +336,18 @@ record BlockOutput(
     LineOutput[] Lines);
 
 record LineOutput(string Text, BoxOutput Box);
+
+record SimpleExtractionOutput(
+    string              InputFile,
+    string              ProcessedAt,
+    double              ElapsedSeconds,
+    int                 BlockCount,
+    SimpleBlockOutput[] Blocks);
+
+record SimpleBlockOutput(
+    string    Label,
+    double    Confidence,
+    BoxOutput Box,
+    string    Text);
 
 record BoxOutput(double X, double Y, double Width, double Height);

@@ -20,6 +20,14 @@ public class PaddleOcrRecognizerV5Options
     public int  GpuId  { get; set; } = 0;
 
     /// <summary>
+    /// ONNX Runtime CPU memory arena. When true (default) ORT keeps a reusable memory pool that
+    /// grows to the peak batch's activation size and is not released until the session is disposed —
+    /// fastest, but the plateau memory stays high. Set to false to let ORT free intermediate buffers
+    /// between inference calls: markedly lower steady-state memory at a small per-call overhead.
+    /// </summary>
+    public bool EnableCpuMemArena { get; set; } = true;
+
+    /// <summary>
     /// Maximum width (px) an image is scaled to before inference.
     /// Acts as a safety cap for unusually wide line crops.
     /// </summary>

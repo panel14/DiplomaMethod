@@ -1,5 +1,8 @@
+using System.Text.Json.Serialization;
+
 namespace DiplomaMethod.Core.Options;
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum WordSegmentationMode
 {
     None,        // Paddle на всю строку, пробелы не вставляются

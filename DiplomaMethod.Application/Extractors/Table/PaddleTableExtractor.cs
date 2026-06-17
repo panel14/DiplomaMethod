@@ -19,9 +19,12 @@ public class PaddleTableExtractor : IExtractor, IDisposable
 
     public PaddleTableExtractor(PaddleOcrRecognizerV3Options options)
     {
+        // CPU backend: mkldnn (oneDNN) on Windows, but OpenBLAS elsewhere. oneDNN fails a primitive
+        // on some Linux/WSL CPUs ("dnnl::error: could not execute a primitive"), so on non-Windows we
+        // use the OpenBLAS-built native (Sdcb.PaddleInference.runtime.linux-x64.openblas) instead.
         Action<PaddleConfig> device = options.UseGpu
             ? PaddleDevice.Gpu(options.GpuId, options.GpuInitialMemoryMb)
-            : PaddleDevice.Mkldnn();
+            : (OperatingSystem.IsWindows() ? PaddleDevice.Mkldnn() : PaddleDevice.Blas());
 
         _tableRecognizer = new PaddleOcrTableRecognizer(
             LocalTableRecognitionModel.ChineseMobileV2_SLANET, device);

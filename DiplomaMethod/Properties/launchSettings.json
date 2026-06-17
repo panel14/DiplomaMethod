@@ -1,7 +1,8 @@
 {
   "profiles": {
     "DiplomaMethod": {
-      "commandName": "Project"
+      "commandName": "Project",
+      "commandLineArgs": "D:\\diploma_test\\src"
     },
     "Container (Dockerfile)": {
       "commandName": "Docker"
